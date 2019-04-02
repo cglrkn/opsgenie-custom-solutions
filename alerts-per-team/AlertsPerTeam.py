@@ -1,189 +1,207 @@
 import requests
 import json
+import time
+import os
 
-############ OpsGenie Configuration ##############
-opsGenieAPIKey = "<Your OpsGenie API Key>"
-opsGenieAPIURL = "https://api.opsgenie.com"
-opsGenieAlertEndPoint = "/v1/json/alert"
-opsGenieAlertAddNoteEndPoint = opsGenieAlertEndPoint + "/note"
-opsGenieAlertCloseEndPoint = opsGenieAlertEndPoint + "/close"
-opsGenieAlertAddTagsEndPoint = opsGenieAlertEndPoint + "/tags"
-
-
-# Makes a GET request to OpsGenie Alert API and returns the alert with given alert id.
-def get_alert(alert_id):
-    params = {
-        "apiKey": opsGenieAPIKey,
-        "id": alert_id
-    }
-
-    request = requests.get(opsGenieAPIURL + opsGenieAlertEndPoint, params=params)
-    alert = request.json()
-
-    return alert
+#
+#   **** Opsgenie Configuration ****
+#
+opsgenie_api_url = "https://api.opsgenie.com"
+opsgenie_alert_endpoint = "/v2/alerts/"
+opsgenie_teams_endpoint = "/v2/teams/"
+tinyId_req_params = {'identifierType': 'tiny'}
+auth_header = {'Authorization': 'GenieKey ' + os.environ["OG_API_KEY"]}
 
 
-# Creates sub-alerts for each team given by "teamsToNotify" in the alert details.
-def create_sub_alerts(alert_description, alert_details, event):
-    alert_to_create = event["alert"]
-    alert_to_create["apiKey"] = opsGenieAPIKey
-    alert_to_create["description"] = alert_description
-    alert_to_create["details"] = alert_details
+def lambda_handler(event, context):
+    # Makes a GET request to OpsGenie Alert API and returns the alert with given alert id.
+    def get_alert(alertTinyId):
+        req = requests.get(opsgenie_api_url + opsgenie_alert_endpoint + alertTinyId, params=tinyId_req_params,
+                           headers=auth_header)
+        alert = req.json()
 
-    teams_list = str(alert_details["teamsToNotify"])
+        return alert["data"]
 
-    teams = teams_list.split(',')
+    def get_alert_tinyid(alertId):
+        req = requests.get(opsgenie_api_url + opsgenie_alert_endpoint + alertId, params=None, headers=auth_header)
+        alert = req.json()
 
-    results = []
+        return alert["data"]["tinyId"]
 
-    for team in teams:
-        team = team.strip()
+    def get_alert_description_and_details(alertTinyId):
+        alert = get_alert(alertTinyId)
 
-        alert_to_create["teams"] = team
+        description = alert["description"]
+        details = alert["details"]
 
-        if "teamsToNotify" in alert_to_create["details"]:
-            del alert_to_create["details"]["teamsToNotify"]
+        result = (description, details)
 
-        alert_to_create["alias"] = ""
-        alert_to_create["details"]["rootAlertId"] = event["alert"]["alertId"]
-        alert_to_create["user"] = "AWSLambda"  # Set the user as AWSLambda, in order to prevent loop when the
-        # the callback of creating alert arrives.
+        return result
 
-        request = requests.post(opsGenieAPIURL + opsGenieAlertEndPoint, json=alert_to_create)
-        result = request.json()
-        results.append("Create sub-alert result for team [" + team + "]: " + json.dumps(result)
-                       .decode('string_escape'))
+    # Creates sub-alerts for each team given by "teamsToNotify" in the alert details.
+    def create_sub_alerts(alert_description, alert_details):
+        alert_to_create = event["alert"]
+        alert_to_create["description"] = alert_description
+        alert_to_create["details"] = alert_details
+        alert_tinyId = event["alert"]["tinyId"]
 
-        request_data_add_tag = {
-            "apiKey": opsGenieAPIKey,
-            "id": event["alert"]["alertId"],
-            "tags": "subAlert:" + result["alertId"]
+        teams_list = str(alert_details["teamsToNotify"])
+
+        teams = teams_list.split(',')
+
+        results = []
+
+        for team in teams:
+            team = team.strip()
+
+            alert_to_create["teams"] = [{"name": team}]
+
+            if "teamsToNotify" in alert_to_create["details"]:
+                del alert_to_create["details"]["teamsToNotify"]
+
+            alert_to_create["alias"] = ""
+            alert_to_create["details"]["rootAlertTinyId"] = event["alert"]["tinyId"]
+            alert_to_create["user"] = "AWSLambda"  # Set the user as AWSLambda, in order to prevent loop when the
+            # the callback of creating alert arrives.
+
+            req = requests.post(opsgenie_api_url + opsgenie_alert_endpoint, json=alert_to_create, params=None,
+                                headers=auth_header)
+            result = req.json()
+
+            results.append(
+                "Create sub-alert result for team [" + team + "]: " + json.dumps(result).decode('string_escape'))
+            for i in range(0, 3):
+                time.sleep(0.3)
+                req_get_sub_alert = requests.get("https://api.opsgenie.com/v2/alerts/requests/" + result["requestId"],
+                                                 params=None, headers=auth_header)
+                result_of_sub = req_get_sub_alert.json()
+                if result_of_sub["data"]["success"]:
+                    break
+
+            sub_tinyId = get_alert_tinyid(result_of_sub["data"]["alertId"])
+            req_data_add_tag = {
+                "tags": ["subAlert:" + sub_tinyId]
+            }
+
+            req_add_tag = requests.post(opsgenie_api_url + opsgenie_alert_endpoint + alert_tinyId + "/tags",
+                                        json=req_data_add_tag, params=tinyId_req_params, headers=auth_header)
+            result_add_tag = req_add_tag.json()
+            results.append(
+                "Add tags to root alert result for sub-alert: " + json.dumps(result_add_tag).decode('string_escape'))
+
+        return results
+
+    # Adds a note to the root alert when a sub-alert is acknowledged.
+    def add_note_to_the_root_alert(alert_details):
+        root_alert_tinyId = alert_details["rootAlertTinyId"]
+
+        alert_tinyId = event["alert"]["tinyId"]
+
+        alert_req = get_alert(alert_tinyId)
+
+        team_id_that_acks = alert_req["teams"][0]["id"]
+
+        req_team = requests.get(opsgenie_api_url + opsgenie_teams_endpoint + team_id_that_acks, params=None,
+                                headers=auth_header)
+
+        team_that_acks = req_team.json()
+
+        team_name_acks = str(team_that_acks["data"]["name"])
+
+        req_data = {
+            "note": "User [" + event["alert"][
+                "username"] + "] acknowledged the alert for team [" + team_name_acks + "]."
         }
 
-        request_add_tag = requests.post(opsGenieAPIURL + opsGenieAlertAddTagsEndPoint, json=request_data_add_tag)
-        result_add_tag = request_add_tag.json()
-        results.append("Add tags to root alert result for sub-alert [" + result["alertId"] + "]: " +
-                       json.dumps(result_add_tag).decode('string_escape'))
+        req = requests.post(opsgenie_api_url + opsgenie_alert_endpoint + root_alert_tinyId + "/notes",
+                            json=req_data, params=tinyId_req_params, headers=auth_header)
 
-    return results
+        result = req.json()
 
+        return "Result of AddNote to Root Alert: " + str(result)
 
-# Adds a note to the root alert when a sub-alert is acknowledged.
-def add_note_to_root_alert(alert_details, event):
-    root_alert_id = alert_details["rootAlertId"]
+    # Closes the root and the sub-alerts when either the root alert or one of the sub-alerts is closed.
+    def close_root_and_sub_alerts(alert_details):
+        results = []
 
-    alert = get_alert(event["alert"]["alertId"])
+        if "teamsToNotify" in alert_details:
+            tags = event["alert"]["tags"]
 
-    team_that_acks = str(alert["teams"][0])
+            for tag in tags:
+                if str(tag).startswith("subAlert:"):
+                    sub_tinyId = str(tag).replace("subAlert:", "")
 
-    request_data = {
-        "apiKey": opsGenieAPIKey,
-        "id": root_alert_id,
-        "note": "User [" + event["alert"]["username"] + "] acknowledged the alert for team [" + team_that_acks +
-                "]."
-    }
-
-    request = requests.post(opsGenieAPIURL + opsGenieAlertAddNoteEndPoint, json=request_data)
-
-    result = request.json()
-
-    return "Result of AddNote to Root Alert: " + str(result)
-
-
-# Closes the root and the sub-alerts when either the root alert or one of the sub-alerts is closed.
-def close_root_and_sub_alerts(alert_details, event):
-    results = []
-
-    if "teamsToNotify" in alert_details:
-        tags = event["alert"]["tags"]
-
-        for tag in tags:
-            if str(tag).startswith("subAlert:"):
-                sub_alert_id = str(tag).replace("subAlert:", "")
-
-                request_data = {
-                    "apiKey": opsGenieAPIKey,
-                    "id": sub_alert_id,
-                    "user": "AWSLambda"
-                }
-
-                request = requests.post(opsGenieAPIURL + opsGenieAlertCloseEndPoint, json=request_data)
-                result = request.json()
-
-                if int(result["code"]) == 21:
-                    results.append("Ignoring closing sub-alert [" + sub_alert_id +
-                                   "], because it was already closed.")
-                else:
-                    results.append("Close sub-alert result for sub-alert [" + sub_alert_id + "]: " +
-                                   json.dumps(result).decode('string_escape'))
-    elif "rootAlertId" in alert_details:
-        root_alert_id = alert_details["rootAlertId"]
-        root_alert = get_alert(root_alert_id)
-        tags = root_alert["tags"]
-
-        for tag in tags:
-            if str(tag).startswith("subAlert:"):
-                sub_alert_id = str(tag).replace("subAlert:", "")
-
-                if sub_alert_id != event["alert"]["alertId"]:
-                    request_data = {
-                        "apiKey": opsGenieAPIKey,
-                        "id": sub_alert_id,
+                    reqData = {
                         "user": "AWSLambda"
                     }
 
-                    request = requests.post(opsGenieAPIURL + opsGenieAlertCloseEndPoint, json=request_data)
-                    result = request.json()
+                    requests.post(opsgenie_api_url + opsgenie_alert_endpoint + sub_tinyId + "/close",
+                                  params=tinyId_req_params, json=reqData, headers=auth_header)
 
-                    if int(result["code"]) == 21:
-                        results.append("Ignoring closing sub-alert [" + sub_alert_id +
-                                       "], because it was already closed.")
-                    else:
-                        results.append("Close sub-alert result for sub-alert [" + sub_alert_id + "]: " +
-                                       json.dumps(result).decode('string_escape'))
+        elif "rootAlertTinyId" in alert_details:
+            root_alert_tinyId = alert_details["rootAlertTinyId"]
+            root_alert = get_alert(root_alert_tinyId)
+            tags = root_alert["tags"]
 
-        request_data_to_close_root_alert = {
-            "apiKey": opsGenieAPIKey,
-            "id": root_alert_id,
-            "user": "AWSLambda"
-        }
+            for tag in tags:
+                print(tag)
+                if str(tag).startswith("subAlert:"):
+                    sub_tinyId = str(tag).replace("subAlert:", "")
 
-        request_close_root_alert = requests.post(opsGenieAPIURL + opsGenieAlertCloseEndPoint,
-                                             json=request_data_to_close_root_alert)
-        result_close_root_alert = request_close_root_alert.json()
+                    if sub_tinyId != event["alert"]["tinyId"]:
+                        reqData = {
+                            "user": "AWSLambda"
+                        }
 
-        if int(result_close_root_alert["code"]) == 21:
-            results.append("Ignoring closing root alert [" + root_alert_id + "], because it was already closed.")
+                        requests.post(
+                            opsgenie_api_url + opsgenie_alert_endpoint + sub_tinyId + "/close",
+                            json=reqData,
+                            params=tinyId_req_params,
+                            headers=auth_header)
+
+            req_data_close_root_alert = {
+                "user": "AWSLambda"
+            }
+            requests.post(
+                opsgenie_api_url + opsgenie_alert_endpoint + root_alert_tinyId + "/close",
+                json=req_data_close_root_alert, params=tinyId_req_params, headers=auth_header)
         else:
-            results.append("Close root alert [" + root_alert_id + "] result: " +
-                           json.dumps(result_close_root_alert).decode('string_escape'))
-    else:
-        results.append("Alert is neither a root alert nor a sub-alert.")
+            results.append("Alert is neither a root alert nor a sub-alert.")
 
-    return results
+        return results
 
+    # Load API Gateway event "body" as dict
+    event = json.loads(event["body"])
 
-# Entry point.
-def lambda_handler(event, context):
     action = event["action"]
-    alert = get_alert(event["alert"]["alertId"])
-    alert_description = alert["description"]
-    alert_details = alert["details"]
+
+    alert_description_and_details_tuple = get_alert_description_and_details(event["alert"]["tinyId"])
+    alert_description = alert_description_and_details_tuple[0]
+    alert_details = alert_description_and_details_tuple[1]
 
     if str(action).lower() == "create":
         if "teamsToNotify" in alert_details.keys() and event["alert"]["username"] != "AWSLambda":
-            print str(create_sub_alerts(alert_description, alert_details, event))
+            print
+            str(create_sub_alerts(alert_description, alert_details))
         else:
-            print "Ignoring Action [" + action + "] since it\'s a create action for sub-alert."
+            print
+            "Ignoring Action [" + action + "] since it\'s a create action for sub-alert."
     elif str(action).lower() == "acknowledge":
-        if "rootAlertId" in alert_details.keys():
-            print str(add_note_to_root_alert(alert_details, event))
+        if "rootAlertTinyId" in alert_details.keys():
+            print
+            str(add_note_to_the_root_alert(alert_details))
         else:
-            print "Ignoring Action [" + action + "] since it\'s an acknowledge action for root alert."
+            print
+            "Ignoring Action [" + action + "] since it\'s an acknowledge action for root alert."
     elif str(action).lower() == "close":
         if event["alert"]["username"] != "AWSLambda":
-            print str(close_root_and_sub_alerts(alert_details, event))
+            print
+            str(close_root_and_sub_alerts(alert_details))
         else:
-            print "Ignoring close action since it's for an already closed alert."
+            print
+            "Ignoring close action since it's for an already closed alert."
     else:
-        print "Ignoring Action [" + action + "]."
+        print
+        "Ignoring Action [" + action + "]."
+
+    return {"statusCode": 200}
